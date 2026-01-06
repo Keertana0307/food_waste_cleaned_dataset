@@ -1,0 +1,165 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from xgboost import XGBRegressor
+
+# 1. LOAD CLEANED DATASET
+url = "https://raw.githubusercontent.com/Keertana0307/food_waste_cleaned_dataset/main/cleaned_food_waste_dataset.xlsx"
+df = pd.read_excel(url)
+
+# Standardize column names
+df.columns = (
+    df.columns.str.strip()
+    .str.lower()
+    .str.replace(" ", "_")
+    .str.replace("-", "_")
+)
+
+print("Dataset loaded:", df.shape)
+
+# 2. REMOVE EXTREME OUTLIERS
+numeric_cols = [
+    "tons_waste", "tons_surplus", "tons_supply", "tons_uneaten",
+    "surplus_total_100_year_mtco2e_footprint",
+    "surplus_total_100_year_mtch4_footprint",
+    "gallons_water_footprint", "meals_wasted", "year"
+]
+
+for col in numeric_cols:
+    if col in df.columns:
+        lower = df[col].quantile(0.01)
+        upper = df[col].quantile(0.99)
+        df = df[(df[col] >= lower) & (df[col] <= upper)]
+
+print("Extreme outliers removed using 1st/99th percentile clipping.")
+
+# 3. LOG-TRANSFORM TARGET
+target = "tons_waste"
+df[target + "_log"] = np.log1p(df[target])
+print("Log-transform applied to target.")
+
+
+# 4. FEATURES AND TARGET
+target = "tons_waste"
+df[target + "_log"] = np.log1p(df[target])
+
+# Features
+categorical_cols = ["state", "sector", "sub_sector", "food_type"]
+numerical_cols = [c for c in numeric_cols if c != target]
+features = numerical_cols + categorical_cols
+
+X = df[features]
+y = df[target + "_log"]  # <- use this EXACTLY
+
+# 5. PREPROCESSOR
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", "passthrough", numerical_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols)
+    ]
+)
+
+# 6. XGBOOST MODEL
+pipeline = Pipeline([
+    ("preprocessor", preprocessor),
+    ("model", XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=9,
+        subsample=1.0,
+        colsample_bytree=0.8,
+        random_state=42
+    ))
+])
+
+# 7. 5-FOLD CROSS-VALIDATION
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+rmse_list = []
+mae_list = []
+r2_list = []
+
+for train_idx, val_idx in kf.split(X):
+    X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+    # Train on log target
+    pipeline.fit(X_train, y_train)
+
+    # Predict log values
+    y_pred_log = pipeline.predict(X_val)
+
+    # Convert predictions and true values back to original scale
+    y_val_orig = np.expm1(y_val)
+    y_pred_orig = np.expm1(y_pred_log)
+
+    # Compute metrics in original scale
+    rmse_list.append(np.sqrt(mean_squared_error(y_val_orig, y_pred_orig)))
+    mae_list.append(mean_absolute_error(y_val_orig, y_pred_orig))
+    r2_list.append(r2_score(y_val_orig, y_pred_orig))
+
+# 8. REPORT RESULTS
+print("Performance Results (XGBoost):")
+print(f"RMSE: {np.mean(rmse_list):.4f}")
+print(f"MAE:  {np.mean(mae_list):.4f}")
+print(f"R²:   {np.mean(r2_list):.4f}")
+
+# Feature Importance
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 1. Fit pipeline on full data (log target)
+pipeline.fit(X, y)
+
+# 2. Extract trained XGBoost model
+xgb_model = pipeline.named_steps["model"]
+
+# 3. Get numeric feature names
+num_features = numerical_cols
+
+# 4. Get categorical feature names after OneHotEncoding
+cat_features = pipeline.named_steps["preprocessor"] \
+    .named_transformers_["cat"] \
+    .get_feature_names_out(categorical_cols)
+
+# 5. Combine all feature names
+all_features = np.concatenate([num_features, cat_features])
+
+# 6. Get XGBoost feature importances
+importances = xgb_model.feature_importances_
+
+# 7. Build a DataFrame for easy viewing
+feature_importance_df = pd.DataFrame({
+    "feature": all_features,
+    "importance": importances
+}).sort_values(by="importance", ascending=False)
+
+# 8. Display all feature importances with decimals (not scientific notation)
+pd.set_option("display.float_format", "{:.5f}".format)
+print(feature_importance_df)
+
+top10_features = feature_importance_df.head(10)
+print("Top 10 Feature Importances (XGBoost):")
+print(top10_features)
+
+# 9. Plot top 10 features
+plt.figure(figsize=(10,6))
+plt.barh(feature_importance_df["feature"].head(10)[::-1],
+         feature_importance_df["importance"].head(10)[::-1])
+plt.xlabel("Feature Importance")
+plt.title("Top 10 Feature Importances (XGBoost)")
+plt.show()
+
+# 10. Plot the 5 least important features
+plt.figure(figsize=(10,6))
+plt.barh(feature_importance_df["feature"].tail(5),
+         feature_importance_df["importance"].tail(5))
+plt.xlabel("Feature Importance")
+plt.title("5 Least Important Features (XGBoost)")
+plt.show()
