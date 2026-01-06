@@ -1,0 +1,217 @@
+# ============================================================
+# KiNN with Extreme Outlier Handling + 5-Fold CV (FINAL)
+# ============================================================
+
+# ==========================================
+# 0. IMPORT LIBRARIES
+# ==========================================
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# ==========================================
+# 1. LOAD CLEANED DATASET
+# ==========================================
+url = "https://raw.githubusercontent.com/Keertana0307/food_waste_cleaned_dataset/main/cleaned_food_waste_dataset.xlsx"
+df = pd.read_excel(url)
+
+# Standardize column names
+df.columns = (
+    df.columns.str.strip()
+    .str.lower()
+    .str.replace(" ", "_")
+    .str.replace("-", "_")
+)
+
+print("✅ Dataset loaded:", df.shape)
+
+# ==========================================
+# 2. REMOVE EXTREME OUTLIERS (1st–99th percentile)
+# ==========================================
+numeric_cols = [
+    "tons_waste", "tons_surplus", "tons_supply", "tons_uneaten",
+    "surplus_total_100_year_mtco2e_footprint",
+    "surplus_total_100_year_mtch4_footprint",
+    "gallons_water_footprint", "meals_wasted", "year"
+]
+
+for col in numeric_cols:
+    if col in df.columns:
+        lower = df[col].quantile(0.01)
+        upper = df[col].quantile(0.99)
+        df = df[(df[col] >= lower) & (df[col] <= upper)]
+
+print("✅ Extreme outliers removed.")
+print("Dataset after outlier removal:", df.shape)
+
+# ==========================================
+# 3. LOG-TRANSFORM TARGET
+# ==========================================
+target = "tons_waste"
+df["tons_waste_log"] = np.log1p(df[target])
+
+# ==========================================
+# 4. DEFINE FEATURES
+# ==========================================
+categorical_cols = ["state", "sector", "sub_sector", "food_type"]
+numerical_cols = [c for c in numeric_cols if c != target]
+
+X = df[categorical_cols + numerical_cols].copy()
+y_log = df["tons_waste_log"].values
+y_actual = df[target].values
+
+# ==========================================
+# 5. ENCODE + SCALE FEATURES
+# ==========================================
+label_encoders = {}
+for col in categorical_cols:
+    le = LabelEncoder()
+    X[col] = le.fit_transform(X[col].astype(str))
+    label_encoders[col] = le
+
+scaler = StandardScaler()
+X[numerical_cols] = scaler.fit_transform(X[numerical_cols])
+
+X_np = X.values.astype(np.float32)
+
+# ==========================================
+# 6. KiNN MODEL DEFINITION
+# ==========================================
+class KiNN(nn.Module):
+    def __init__(self, cat_sizes, num_numeric):
+        super().__init__()
+
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(size, min(50, size // 2 + 1))
+            for size in cat_sizes
+        ])
+
+        emb_dim = sum(e.embedding_dim for e in self.embeddings)
+
+        self.network = nn.Sequential(
+            nn.Linear(emb_dim + num_numeric, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        cat_x = x[:, :len(self.embeddings)].long()
+        num_x = x[:, len(self.embeddings):]
+
+        emb_out = [emb(cat_x[:, i]) for i, emb in enumerate(self.embeddings)]
+        emb_out = torch.cat(emb_out, dim=1)
+
+        x = torch.cat([emb_out, num_x], dim=1)
+        return self.network(x)
+
+# ==========================================
+# 7. TRAINING FUNCTION
+# ==========================================
+def train_kinn(X_train, y_train, X_val, y_val, cat_sizes, num_numeric,
+               epochs=100, batch_size=256, patience=5):
+
+    train_loader = DataLoader(
+        TensorDataset(X_train, y_train),
+        batch_size=batch_size,
+        shuffle=True
+    )
+
+    val_loader = DataLoader(
+        TensorDataset(X_val, y_val),
+        batch_size=batch_size
+    )
+
+    model = KiNN(cat_sizes, num_numeric)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+
+    best_loss = np.inf
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        model.train()
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                val_loss += criterion(model(xb), yb).item()
+        val_loss /= len(val_loader)
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    return model
+
+# ==========================================
+# 8. 5-FOLD CROSS-VALIDATION
+# ==========================================
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+cat_sizes = [X[col].nunique() for col in categorical_cols]
+num_numeric = len(numerical_cols)
+
+mae_list, rmse_list, r2_list = [], [], []
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_np), 1):
+    print(f"\n🔁 Fold {fold}")
+
+    X_train, X_test = X_np[train_idx], X_np[test_idx]
+    y_train_log, y_test_actual = y_log[train_idx], y_actual[test_idx]
+
+    # Tensor conversion (FIXED dtype issue)
+    X_train = torch.tensor(X_train, dtype=torch.float32)
+    X_test = torch.tensor(X_test, dtype=torch.float32)
+
+    y_train_log = torch.tensor(y_train_log, dtype=torch.float32).view(-1, 1)
+
+    # Validation split
+    val_size = int(0.1 * len(X_train))
+    X_val, y_val = X_train[:val_size], y_train_log[:val_size]
+    X_train, y_train_log = X_train[val_size:], y_train_log[val_size:]
+
+    model = train_kinn(
+        X_train, y_train_log,
+        X_val, y_val,
+        cat_sizes, num_numeric
+    )
+
+    model.eval()
+    with torch.no_grad():
+        y_pred_log = model(X_test).numpy().flatten()
+        y_pred = np.expm1(y_pred_log)
+
+    mae_list.append(mean_absolute_error(y_test_actual, y_pred))
+    rmse_list.append(np.sqrt(mean_squared_error(y_test_actual, y_pred)))
+    r2_list.append(r2_score(y_test_actual, y_pred))
+
+# ==========================================
+# 9. FINAL RESULTS
+# ==========================================
+print("\n✅ KiNN 5-Fold Cross-Validation Results")
+print(f"Average MAE : {np.mean(mae_list):,.2f}")
+print(f"Average RMSE: {np.mean(rmse_list):,.2f}")
+print(f"Average R²  : {np.mean(r2_list):.4f}")
